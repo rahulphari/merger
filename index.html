@@ -46,6 +46,16 @@
         .step-complete {
             @apply border-green-500 text-green-600 bg-green-50;
         }
+        .animate-pulse-fast {
+            animation: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-slide-up {
+            animation: slideIn 0.3s ease-out forwards;
+        }
     </style>
 </head>
 <body class="bg-gray-50 font-sans text-slate-800">
@@ -64,7 +74,9 @@
             Filter: () => <i data-lucide="filter" className="w-5 h-5"></i>,
             Download: () => <i data-lucide="download" className="w-4 h-4 mr-2"></i>,
             Alert: () => <i data-lucide="alert-circle" className="w-5 h-5 text-amber-500"></i>,
-            Database: () => <i data-lucide="database" className="w-5 h-5"></i>
+            Database: () => <i data-lucide="database" className="w-5 h-5"></i>,
+            Link: () => <i data-lucide="link" className="w-4 h-4"></i>,
+            Refresh: () => <i data-lucide="refresh-cw" className="w-4 h-4"></i>
         };
 
         // --- Main Application ---
@@ -72,14 +84,21 @@
             // Steps: 0: Upload, 1: Anchor, 2: Filter, 3: Columns, 4: Result
             const [step, setStep] = useState(0);
             
+            // Loading State
+            const [loading, setLoading] = useState(false);
+            const [progress, setProgress] = useState(0);
+            const [statusMsg, setStatusMsg] = useState('');
+
             // Data State
             const [files, setFiles] = useState([]);
             const [rawData, setRawData] = useState({}); // { fileName: [rows] }
             const [headers, setHeaders] = useState({}); // { fileName: [header1, header2] }
             
             // Selection State
-            const [commonHeaders, setCommonHeaders] = useState([]);
-            const [anchor, setAnchor] = useState('');
+            // anchorMapping: maps fileName -> columnName (e.g. {"A.csv": "ID", "B.csv": "id"})
+            const [anchorMapping, setAnchorMapping] = useState({}); 
+            const [detectedAnchors, setDetectedAnchors] = useState([]);
+            const [isManualAnchor, setIsManualAnchor] = useState(false);
             
             const [enableFilter, setEnableFilter] = useState(false);
             const [filterConfig, setFilterConfig] = useState({ column: '', value: '', sourceFile: '' });
@@ -94,16 +113,53 @@
                 if (window.lucide) window.lucide.createIcons();
             });
 
-            // Calculate Common Headers when files change
+            // Smart Anchor Detection when headers change
             useEffect(() => {
                 const fileNames = Object.keys(headers);
-                if (fileNames.length > 0) {
-                    // Find intersection of all header arrays
-                    let common = headers[fileNames[0]];
-                    for (let i = 1; i < fileNames.length; i++) {
-                        common = common.filter(h => headers[fileNames[i]].includes(h));
-                    }
-                    setCommonHeaders(common);
+                if (fileNames.length < 2) {
+                    setDetectedAnchors([]);
+                    return;
+                }
+
+                // 1. Normalize all headers to lowercase for comparison
+                const normalizedMap = {}; // { fileName: { "lowercase_col": "Original Col" } }
+                fileNames.forEach(f => {
+                    normalizedMap[f] = {};
+                    headers[f].forEach(h => normalizedMap[f][h.toString().toLowerCase().trim()] = h);
+                });
+
+                // 2. Find intersection of lowercase keys
+                let candidates = Object.keys(normalizedMap[fileNames[0]]);
+                for (let i = 1; i < fileNames.length; i++) {
+                    const fileKeys = Object.keys(normalizedMap[fileNames[i]]);
+                    candidates = candidates.filter(k => fileKeys.includes(k));
+                }
+
+                // 3. Build suggestion objects
+                const suggestions = candidates.map(key => {
+                    const map = {};
+                    let isExact = true;
+                    const displayLabel = normalizedMap[fileNames[0]][key]; 
+
+                    fileNames.forEach(f => {
+                        const original = normalizedMap[f][key];
+                        map[f] = original;
+                        if (original !== displayLabel) isExact = false;
+                    });
+
+                    return {
+                        label: displayLabel,
+                        key: key,
+                        isExact: isExact,
+                        mapping: map
+                    };
+                });
+
+                setDetectedAnchors(suggestions);
+                
+                // Auto-select if exact match found and not already set
+                if (suggestions.length > 0 && Object.keys(anchorMapping).length === 0) {
+                     // Optionally auto-select, but manual confirmation is often safer
                 }
             }, [headers]);
 
@@ -111,35 +167,73 @@
 
             const handleFileUpload = async (e) => {
                 const uploadedFiles = Array.from(e.target.files);
-                const newFiles = [...files, ...uploadedFiles];
-                setFiles(newFiles);
+                if (uploadedFiles.length === 0) return;
 
-                // Parse files
+                setLoading(true);
+                setStep(0);
+                
                 const newRawData = { ...rawData };
                 const newHeaders = { ...headers };
+                const newFiles = [...files];
 
-                for (let file of uploadedFiles) {
-                    const data = await parseFile(file);
-                    newRawData[file.name] = data;
-                    if (data.length > 0) {
-                        newHeaders[file.name] = Object.keys(data[0]);
+                // Process files sequentially to update UI progress
+                for (let i = 0; i < uploadedFiles.length; i++) {
+                    const file = uploadedFiles[i];
+                    setStatusMsg(`Processing ${file.name}...`);
+                    setProgress(Math.round(((i) / uploadedFiles.length) * 100));
+                    
+                    // Yield to main thread to allow UI update
+                    await new Promise(resolve => setTimeout(resolve, 50));
+
+                    try {
+                        const data = await parseFile(file);
+                        // dedupe file name if necessary
+                        let fileName = file.name;
+                        let counter = 1;
+                        while(newRawData[fileName]) {
+                            fileName = `${file.name.split('.')[0]}_${counter}.${file.name.split('.').pop()}`;
+                            counter++;
+                        }
+
+                        newRawData[fileName] = data;
+                        if (data.length > 0) {
+                            newHeaders[fileName] = Object.keys(data[0]);
+                            newFiles.push({ name: fileName, originalFile: file });
+                        }
+                    } catch (err) {
+                        console.error("Error processing " + file.name, err);
+                        alert(`Failed to read ${file.name}. Ensure it is a valid Excel/CSV file.`);
                     }
                 }
                 
+                setFiles(newFiles);
                 setRawData(newRawData);
                 setHeaders(newHeaders);
+                
+                setProgress(100);
+                setStatusMsg('Done!');
+                setTimeout(() => {
+                    setLoading(false);
+                    setStatusMsg('');
+                    setProgress(0);
+                }, 500);
             };
 
             const parseFile = (file) => {
                 return new Promise((resolve, reject) => {
                     const reader = new FileReader();
                     reader.onload = (e) => {
-                        const data = new Uint8Array(e.target.result);
-                        const workbook = XLSX.read(data, { type: 'array' });
-                        const firstSheetName = workbook.SheetNames[0];
-                        const worksheet = workbook.Sheets[firstSheetName];
-                        const jsonData = XLSX.utils.sheet_to_json(worksheet, { defval: "" }); // defval ensures empty cells exist
-                        resolve(jsonData);
+                        try {
+                            const data = new Uint8Array(e.target.result);
+                            const workbook = XLSX.read(data, { type: 'array' });
+                            const firstSheetName = workbook.SheetNames[0];
+                            const worksheet = workbook.Sheets[firstSheetName];
+                            // Parse data, treat all as strings initially to avoid type mismatches during loose comparison
+                            const jsonData = XLSX.utils.sheet_to_json(worksheet, { defval: "" }); 
+                            resolve(jsonData);
+                        } catch (err) {
+                            reject(err);
+                        }
                     };
                     reader.onerror = reject;
                     reader.readAsArrayBuffer(file);
@@ -149,12 +243,31 @@
             const removeFile = (fileName) => {
                 const newFiles = files.filter(f => f.name !== fileName);
                 setFiles(newFiles);
+                
                 const newRawData = { ...rawData };
                 delete newRawData[fileName];
                 setRawData(newRawData);
+                
                 const newHeaders = { ...headers };
                 delete newHeaders[fileName];
                 setHeaders(newHeaders);
+
+                // Cleanup mappings
+                const newMapping = { ...anchorMapping };
+                delete newMapping[fileName];
+                setAnchorMapping(newMapping);
+            };
+
+            const applyAutoAnchor = (suggestion) => {
+                setAnchorMapping(suggestion.mapping);
+                setIsManualAnchor(false);
+            };
+
+            const updateManualAnchor = (fileName, colName) => {
+                setAnchorMapping(prev => ({
+                    ...prev,
+                    [fileName]: colName
+                }));
             };
 
             const toggleColumnSelection = (fileName, col) => {
@@ -174,61 +287,83 @@
             };
 
             const generateMergedData = () => {
-                if (!anchor) return;
-
-                // 1. Identify valid Anchor IDs
-                let validAnchors = new Set();
-                
-                // If filtering is enabled, get anchors only from rows that match the filter
-                if (enableFilter && filterConfig.column && filterConfig.value && filterConfig.sourceFile) {
-                    const sourceData = rawData[filterConfig.sourceFile];
-                    sourceData.forEach(row => {
-                        // Loose comparison for numbers/strings mismatch
-                        if (String(row[filterConfig.column]) === String(filterConfig.value)) {
-                            if (row[anchor]) validAnchors.add(row[anchor]);
-                        }
-                    });
-                } else {
-                    // No filter: Get ALL unique anchors from ALL files
-                    Object.values(rawData).forEach(dataset => {
-                        dataset.forEach(row => {
-                            if (row[anchor]) validAnchors.add(row[anchor]);
-                        });
-                    });
+                // Validation: Ensure all files have an anchor mapped
+                const missingFiles = files.filter(f => !anchorMapping[f.name]);
+                if (missingFiles.length > 0) {
+                    alert(`Please map anchor columns for: ${missingFiles.map(f => f.name).join(', ')}`);
+                    return;
                 }
 
-                // 2. Build the result set
-                const result = [];
-                const anchorList = Array.from(validAnchors);
-
-                anchorList.forEach(key => {
-                    let mergedRow = { [anchor]: key };
+                setLoading(true);
+                setStatusMsg('Merging Data...');
+                
+                // Use setTimeout to allow UI to show "Merging..."
+                setTimeout(() => {
+                    const fileNames = Object.keys(rawData);
                     
-                    // Iterate through each file to find data for this anchor
-                    Object.keys(rawData).forEach(fileName => {
-                        const dataset = rawData[fileName];
-                        // Find the row in this file with the matching anchor
-                        const match = dataset.find(r => r[anchor] == key); // Loose equality for safety
-
-                        if (match) {
-                            // Only copy selected columns
-                            const colsToKeep = selectedColumns[fileName] || [];
-                            colsToKeep.forEach(col => {
-                                if (col !== anchor) { // Avoid duplicate anchor columns
-                                    // Handle duplicate column names across files by appending filename if needed?
-                                    // For simplicity, we'll try to keep unique names or overwrite.
-                                    // A safer way: `${fileName} - ${col}` if generic tool
-                                    const safeColName = Object.keys(rawData).length > 1 ? `${col} (${fileName})` : col;
-                                    mergedRow[safeColName] = match[col];
-                                }
+                    // 1. Identify valid Anchor IDs
+                    let validAnchors = new Set();
+                    
+                    // Logic for "Primary" file for iteration? Or Union of all?
+                    // Typically "Full Outer Join" based on anchors is best, or "Filter-based".
+                    
+                    if (enableFilter && filterConfig.column && filterConfig.value && filterConfig.sourceFile) {
+                        // Filter Mode: Only anchors present in the filtered source
+                        const sourceData = rawData[filterConfig.sourceFile];
+                        const sourceAnchorCol = anchorMapping[filterConfig.sourceFile];
+                        
+                        sourceData.forEach(row => {
+                            if (String(row[filterConfig.column]) === String(filterConfig.value)) {
+                                if (row[sourceAnchorCol]) validAnchors.add(String(row[sourceAnchorCol]));
+                            }
+                        });
+                    } else {
+                        // Default: Union of all anchors
+                        fileNames.forEach(fName => {
+                            const fData = rawData[fName];
+                            const fAnchor = anchorMapping[fName];
+                            fData.forEach(row => {
+                                if (row[fAnchor]) validAnchors.add(String(row[fAnchor]));
                             });
-                        }
-                    });
-                    result.push(mergedRow);
-                });
+                        });
+                    }
 
-                setMergedData(result);
-                setStep(4);
+                    // 2. Build the result set
+                    const result = [];
+                    const anchorList = Array.from(validAnchors);
+                    
+                    // Display name for the anchor column in the output
+                    const anchorDisplayName = detectedAnchors.find(da => da.mapping === anchorMapping)?.label || "Anchor ID";
+
+                    anchorList.forEach(key => {
+                        let mergedRow = { [anchorDisplayName]: key };
+                        
+                        fileNames.forEach(fileName => {
+                            const dataset = rawData[fileName];
+                            const anchorCol = anchorMapping[fileName];
+                            
+                            // Find match (using string comparison for safety)
+                            const match = dataset.find(r => String(r[anchorCol]) === key);
+
+                            if (match) {
+                                const colsToKeep = selectedColumns[fileName] || [];
+                                colsToKeep.forEach(col => {
+                                    // Don't duplicate the anchor column in the data part (optional preference)
+                                    // if (col !== anchorCol) { 
+                                        const safeColName = fileNames.length > 1 ? `${col} (${fileName})` : col;
+                                        mergedRow[safeColName] = match[col];
+                                    // }
+                                });
+                            }
+                        });
+                        result.push(mergedRow);
+                    });
+
+                    setMergedData(result);
+                    setStep(4);
+                    setLoading(false);
+                    setStatusMsg('');
+                }, 100);
             };
 
             const downloadCSV = () => {
@@ -238,17 +373,6 @@
                 XLSX.writeFile(workbook, "compiled_report.xlsx");
             };
 
-            const getAllUniqueColumns = () => {
-                const allCols = [];
-                Object.keys(headers).forEach(fname => {
-                    headers[fname].forEach(h => {
-                        allCols.push({ file: fname, col: h });
-                    });
-                });
-                return allCols;
-            };
-            
-            // Get unique values for the filter dropdown
             const getFilterValues = () => {
                 if (!filterConfig.sourceFile || !filterConfig.column) return [];
                 const data = rawData[filterConfig.sourceFile];
@@ -259,22 +383,37 @@
             // --- Step Renders ---
 
             const renderSteps = () => (
-                <div className="flex justify-between mb-8 relative">
+                <div className="flex justify-between mb-8 relative select-none">
                     <div className="absolute top-1/2 left-0 w-full h-1 bg-gray-200 -z-10 -translate-y-1/2 rounded"></div>
                     {['Upload', 'Anchor Point', 'Filter Target', 'Select Columns', 'Result'].map((label, idx) => {
                         let statusClass = "step-inactive bg-white";
                         if (step === idx) statusClass = "step-active bg-white ring-4 ring-blue-100";
                         if (step > idx) statusClass = "step-complete";
                         
+                        // Disable clicking future steps if not ready
+                        const canClick = step > idx || (idx === step + 1 && step === 0 && files.length > 0); 
+                        
                         return (
-                            <div key={idx} className="flex flex-col items-center gap-2 cursor-pointer" onClick={() => step > idx && setStep(idx)}>
+                            <div key={idx} className={`flex flex-col items-center gap-2 ${canClick ? 'cursor-pointer' : 'cursor-default'}`} onClick={() => canClick && setStep(idx)}>
                                 <div className={`w-8 h-8 rounded-full flex items-center justify-center border-2 font-bold text-sm transition-all ${statusClass}`}>
                                     {step > idx ? <Icons.Check /> : idx + 1}
                                 </div>
-                                <span className={`text-xs font-medium ${step === idx ? 'text-blue-700' : 'text-gray-500'}`}>{label}</span>
+                                <span className={`text-xs font-medium hidden sm:block ${step === idx ? 'text-blue-700' : 'text-gray-500'}`}>{label}</span>
                             </div>
                         );
                     })}
+                </div>
+            );
+
+            // --- UI Components ---
+            
+            const LoadingOverlay = () => (
+                <div className="absolute inset-0 bg-white/90 z-50 flex flex-col items-center justify-center rounded-2xl animate-fade-in">
+                    <div className="w-64 bg-gray-200 rounded-full h-2.5 mb-4 dark:bg-gray-700 overflow-hidden">
+                        <div className="bg-blue-600 h-2.5 rounded-full transition-all duration-300" style={{width: `${progress}%`}}></div>
+                    </div>
+                    <p className="text-slate-700 font-medium animate-pulse">{statusMsg}</p>
+                    <p className="text-slate-400 text-sm mt-1">{progress}%</p>
                 </div>
             );
 
@@ -287,22 +426,26 @@
 
                     {renderSteps()}
 
-                    <div className="bg-white rounded-2xl shadow-xl border border-gray-100 p-6 md:p-10 min-h-[400px]">
+                    <div className="bg-white rounded-2xl shadow-xl border border-gray-100 p-6 md:p-10 min-h-[400px] relative">
                         
+                        {loading && <LoadingOverlay />}
+
                         {/* STEP 1: UPLOAD */}
                         {step === 0 && (
-                            <div className="flex flex-col items-center animate-fade-in">
+                            <div className="flex flex-col items-center animate-slide-up">
                                 <h2 className="text-xl font-semibold mb-6">Step 1: Upload Data Files</h2>
                                 
-                                <div className="w-full max-w-xl border-2 border-dashed border-blue-200 rounded-xl bg-blue-50/50 p-10 flex flex-col items-center justify-center text-center hover:bg-blue-50 transition-colors relative">
+                                <div className="w-full max-w-xl border-2 border-dashed border-blue-200 rounded-xl bg-blue-50/50 p-10 flex flex-col items-center justify-center text-center hover:bg-blue-50 transition-colors relative group">
                                     <input 
                                         type="file" 
                                         multiple 
                                         accept=".csv, .xlsx, .xls"
                                         onChange={handleFileUpload}
-                                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
                                     />
-                                    <Icons.Upload />
+                                    <div className="group-hover:scale-110 transition-transform duration-200">
+                                        <Icons.Upload />
+                                    </div>
                                     <p className="font-medium text-slate-700">Click or Drag files here to upload</p>
                                     <p className="text-sm text-slate-500 mt-1">Supports CSV, Excel (.xlsx, .xls)</p>
                                 </div>
@@ -345,53 +488,108 @@
 
                         {/* STEP 2: ANCHOR POINT */}
                         {step === 1 && (
-                            <div className="flex flex-col items-center animate-fade-in max-w-2xl mx-auto">
+                            <div className="flex flex-col items-center animate-slide-up max-w-3xl mx-auto w-full">
                                 <h2 className="text-xl font-semibold mb-2">Step 2: Select Anchor Point</h2>
-                                <p className="text-slate-500 mb-8 text-center">Choose the common column (e.g., ID, Email) that exists in all files to link the data together.</p>
+                                <p className="text-slate-500 mb-6 text-center">Choose the common column that links your files.</p>
 
-                                {commonHeaders.length === 0 ? (
-                                    <div className="bg-amber-50 text-amber-800 p-4 rounded-lg flex gap-3 items-start border border-amber-200">
-                                        <Icons.Alert />
-                                        <div>
-                                            <p className="font-bold">No common headers found.</p>
-                                            <p className="text-sm mt-1">Please ensure your files have at least one column name that matches exactly (case-sensitive) across all uploaded files.</p>
-                                        </div>
-                                    </div>
-                                ) : (
-                                    <div className="w-full">
-                                        <label className="block text-sm font-medium text-slate-700 mb-2">Anchor Column</label>
-                                        <select 
-                                            value={anchor} 
-                                            onChange={(e) => setAnchor(e.target.value)}
-                                            className="w-full p-3 border border-gray-300 rounded-lg bg-white focus:ring-2 focus:ring-blue-500 outline-none"
-                                        >
-                                            <option value="">-- Select Anchor Column --</option>
-                                            {commonHeaders.map(h => (
-                                                <option key={h} value={h}>{h}</option>
-                                            ))}
-                                        </select>
-
-                                        {anchor && (
-                                            <div className="mt-4 p-4 bg-blue-50 border border-blue-100 rounded-lg text-sm text-blue-800">
-                                                <p className="font-semibold flex items-center gap-2"><Icons.Database /> Analysis Preview:</p>
-                                                <ul className="list-disc pl-5 mt-2 space-y-1">
-                                                    {Object.keys(rawData).map(fname => (
-                                                        <li key={fname}>
-                                                            <span className="font-medium">{fname}:</span> Found anchor <b>{anchor}</b> with {rawData[fname].length} records.
-                                                        </li>
-                                                    ))}
-                                                </ul>
+                                {/* Detection Results */}
+                                {!isManualAnchor && (
+                                    <div className="w-full space-y-4 mb-6">
+                                        {detectedAnchors.length > 0 ? (
+                                            <div>
+                                                <p className="text-sm font-bold text-gray-500 uppercase tracking-wide mb-2">Recommended Anchors (Detected)</p>
+                                                <div className="grid gap-3">
+                                                    {detectedAnchors.map((suggestion, idx) => {
+                                                        // Check if this suggestion is currently selected
+                                                        const isSelected = JSON.stringify(anchorMapping) === JSON.stringify(suggestion.mapping);
+                                                        
+                                                        return (
+                                                            <div 
+                                                                key={idx}
+                                                                onClick={() => applyAutoAnchor(suggestion)}
+                                                                className={`p-4 border rounded-xl cursor-pointer transition-all flex items-center justify-between ${isSelected ? 'border-blue-500 bg-blue-50 ring-1 ring-blue-500' : 'hover:border-blue-300 hover:bg-gray-50'}`}
+                                                            >
+                                                                <div className="flex items-center gap-3">
+                                                                    <div className={`w-5 h-5 rounded-full border flex items-center justify-center ${isSelected ? 'border-blue-600 bg-blue-600 text-white' : 'border-gray-300'}`}>
+                                                                        {isSelected && <i data-lucide="check" className="w-3 h-3"></i>}
+                                                                    </div>
+                                                                    <div>
+                                                                        <p className="font-semibold text-slate-800">{suggestion.label}</p>
+                                                                        <p className="text-xs text-slate-500">
+                                                                            {suggestion.isExact ? 'Exact Match found in all files' : 'Partial/Case-insensitive match found'}
+                                                                        </p>
+                                                                    </div>
+                                                                </div>
+                                                                {!suggestion.isExact && (
+                                                                    <span className="text-xs bg-amber-100 text-amber-700 px-2 py-1 rounded">Fuzzy Match</span>
+                                                                )}
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <div className="bg-amber-50 text-amber-800 p-4 rounded-lg flex gap-3 items-start border border-amber-200">
+                                                <Icons.Alert />
+                                                <div>
+                                                    <p className="font-bold">No obvious common headers found.</p>
+                                                    <p className="text-sm mt-1">We couldn't automatically find a column that exists in all files. Please try the manual mapping below.</p>
+                                                </div>
                                             </div>
                                         )}
+                                        
+                                        <div className="text-center pt-2">
+                                            <button 
+                                                onClick={() => { setIsManualAnchor(true); setAnchorMapping({}); }}
+                                                className="text-blue-600 text-sm font-medium hover:underline flex items-center justify-center gap-1 mx-auto"
+                                            >
+                                                <Icons.Link /> My columns have different names (Manual Map)
+                                            </button>
+                                        </div>
                                     </div>
                                 )}
 
-                                <div className="mt-8 flex gap-3">
+                                {/* Manual Mapping UI */}
+                                {isManualAnchor && (
+                                    <div className="w-full bg-slate-50 border rounded-xl p-6 mb-6">
+                                        <div className="flex justify-between items-center mb-4">
+                                            <h3 className="font-bold text-slate-700">Manual Anchor Mapping</h3>
+                                            <button onClick={() => setIsManualAnchor(false)} className="text-xs text-blue-600 hover:underline">
+                                                Back to Auto-Detect
+                                            </button>
+                                        </div>
+                                        <p className="text-sm text-slate-500 mb-4">Select the column in each file that represents the unique ID.</p>
+                                        
+                                        <div className="space-y-3">
+                                            {files.map(f => (
+                                                <div key={f.name} className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 p-3 bg-white border rounded shadow-sm">
+                                                    <div className="flex items-center gap-2 min-w-[150px]">
+                                                        <Icons.File />
+                                                        <span className="text-sm font-medium truncate" title={f.name}>{f.name}</span>
+                                                    </div>
+                                                    <Icons.ArrowRight />
+                                                    <select 
+                                                        className="flex-1 p-2 border rounded text-sm bg-gray-50 focus:ring-2 focus:ring-blue-500 outline-none"
+                                                        value={anchorMapping[f.name] || ""}
+                                                        onChange={(e) => updateManualAnchor(f.name, e.target.value)}
+                                                    >
+                                                        <option value="">-- Select Column --</option>
+                                                        {headers[f.name]?.map(h => (
+                                                            <option key={h} value={h}>{h}</option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+
+                                <div className="flex gap-3 mt-4">
                                     <button onClick={() => setStep(0)} className="px-6 py-3 rounded-lg text-slate-600 font-medium hover:bg-gray-100">Back</button>
                                     <button 
-                                        disabled={!anchor}
+                                        disabled={Object.keys(anchorMapping).length < files.length}
                                         onClick={() => setStep(2)}
-                                        className={`px-6 py-3 rounded-lg flex items-center gap-2 font-medium transition-all ${!anchor ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-blue-600 text-white hover:bg-blue-700 shadow-lg shadow-blue-200'}`}
+                                        className={`px-6 py-3 rounded-lg flex items-center gap-2 font-medium transition-all ${Object.keys(anchorMapping).length < files.length ? 'bg-gray-200 text-gray-400 cursor-not-allowed' : 'bg-blue-600 text-white hover:bg-blue-700 shadow-lg shadow-blue-200'}`}
                                     >
                                         Next: Filter Data <Icons.ArrowRight />
                                     </button>
@@ -401,7 +599,7 @@
 
                         {/* STEP 3: FILTER */}
                         {step === 2 && (
-                            <div className="flex flex-col items-center animate-fade-in max-w-2xl mx-auto">
+                            <div className="flex flex-col items-center animate-slide-up max-w-2xl mx-auto">
                                 <h2 className="text-xl font-semibold mb-2">Step 3: Target Filter (Optional)</h2>
                                 <p className="text-slate-500 mb-8 text-center">Do you want to focus on a specific subset of data? (e.g., only data from "Facility X")</p>
 
@@ -420,7 +618,7 @@
                                     </div>
 
                                     {enableFilter && (
-                                        <div className="space-y-4 pl-8 border-l-2 border-gray-100 animate-slide-down">
+                                        <div className="space-y-4 pl-8 border-l-2 border-gray-100">
                                             <div>
                                                 <label className="block text-xs uppercase font-bold text-gray-500 mb-1">1. Select File containing the Filter</label>
                                                 <select 
@@ -479,46 +677,45 @@
 
                         {/* STEP 4: COLUMN SELECTION */}
                         {step === 3 && (
-                            <div className="flex flex-col h-full animate-fade-in">
+                            <div className="flex flex-col h-full animate-slide-up">
                                 <h2 className="text-xl font-semibold mb-2 text-center">Step 4: Select Output Columns</h2>
                                 <p className="text-slate-500 mb-6 text-center">Pick which data fields you want in your final report.</p>
 
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
                                     {Object.keys(headers).map(fileName => (
-                                        <div key={fileName} className="border rounded-xl overflow-hidden bg-white shadow-sm">
-                                            <div className="bg-gray-50 p-3 border-b font-medium text-sm flex justify-between items-center">
+                                        <div key={fileName} className="border rounded-xl overflow-hidden bg-white shadow-sm flex flex-col max-h-[300px]">
+                                            <div className="bg-gray-50 p-3 border-b font-medium text-sm flex justify-between items-center flex-shrink-0">
                                                 <span className="truncate" title={fileName}>{fileName}</span>
                                                 <span className="text-xs bg-gray-200 px-2 py-1 rounded text-gray-600">{headers[fileName].length} cols</span>
                                             </div>
-                                            <div className="p-3 max-h-60 overflow-y-auto space-y-2">
+                                            <div className="p-3 overflow-y-auto space-y-2 flex-grow">
                                                 {headers[fileName].map(col => {
-                                                    const isAnchor = col === anchor;
+                                                    const isAnchor = col === anchorMapping[fileName];
                                                     const isChecked = (selectedColumns[fileName] || []).includes(col);
                                                     
                                                     return (
-                                                        <div key={col} className={`flex items-center gap-2 text-sm p-1 rounded hover:bg-gray-50 ${isAnchor ? 'opacity-50' : ''}`}>
+                                                        <div key={col} className={`flex items-center gap-2 text-sm p-1 rounded hover:bg-gray-50 ${isAnchor ? 'bg-blue-50/50' : ''}`}>
                                                             <input 
                                                                 type="checkbox" 
                                                                 id={`${fileName}-${col}`}
                                                                 checked={isChecked}
-                                                                disabled={isAnchor} // Disable unselecting anchor? Or just ignore anchor in selection logic
+                                                                // disabled={isAnchor} // Allow selecting anchor if they want it explicitly in output
                                                                 onChange={() => toggleColumnSelection(fileName, col)}
                                                                 className="rounded text-blue-600 focus:ring-blue-500"
                                                             />
-                                                            <label htmlFor={`${fileName}-${col}`} className={`cursor-pointer select-none truncate flex-1 ${isAnchor ? 'italic text-gray-400' : 'text-slate-700'}`}>
-                                                                {col} {isAnchor && '(Anchor)'}
+                                                            <label htmlFor={`${fileName}-${col}`} className={`cursor-pointer select-none truncate flex-1 ${isAnchor ? 'font-semibold text-blue-700' : 'text-slate-700'}`}>
+                                                                {col} {isAnchor && <span className="text-xs bg-blue-100 px-1 rounded ml-1">Anchor</span>}
                                                             </label>
                                                         </div>
                                                     );
                                                 })}
                                             </div>
-                                            <div className="p-2 border-t bg-gray-50 text-center">
+                                            <div className="p-2 border-t bg-gray-50 text-center flex-shrink-0">
                                                 <button 
                                                     className="text-xs text-blue-600 font-medium hover:underline"
                                                     onClick={() => {
-                                                        const allCols = headers[fileName].filter(c => c !== anchor);
+                                                        const allCols = headers[fileName];
                                                         const current = selectedColumns[fileName] || [];
-                                                        // Toggle all: if all selected, unselect. Else select all.
                                                         if (current.length === allCols.length) {
                                                             setSelectedColumns(prev => ({...prev, [fileName]: []}));
                                                         } else {
@@ -547,12 +744,12 @@
 
                         {/* STEP 5: RESULT */}
                         {step === 4 && (
-                            <div className="flex flex-col items-center animate-fade-in">
+                            <div className="flex flex-col items-center animate-slide-up">
                                 <div className="w-16 h-16 bg-green-100 text-green-600 rounded-full flex items-center justify-center mb-4">
                                     <Icons.Check />
                                 </div>
                                 <h2 className="text-2xl font-bold mb-2 text-slate-800">Compilation Complete!</h2>
-                                <p className="text-slate-500 mb-8">Successfully merged {mergedData.length} records based on anchor <span className="font-mono bg-gray-100 px-1 rounded text-gray-800">{anchor}</span>.</p>
+                                <p className="text-slate-500 mb-8">Successfully merged {mergedData.length} records.</p>
 
                                 {/* Preview Table */}
                                 <div className="w-full border rounded-lg overflow-hidden mb-8 shadow-sm">
@@ -583,7 +780,7 @@
                                 </div>
 
                                 <div className="flex gap-4">
-                                    <button onClick={() => setStep(0)} className="px-6 py-3 rounded-lg border border-gray-300 text-slate-600 font-medium hover:bg-gray-50">
+                                    <button onClick={() => { setStep(0); setFiles([]); setRawData({}); setHeaders({}); setAnchorMapping({}); setMergedData([]); }} className="px-6 py-3 rounded-lg border border-gray-300 text-slate-600 font-medium hover:bg-gray-50">
                                         Start Over
                                     </button>
                                     <button 
