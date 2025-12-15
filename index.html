@@ -76,7 +76,8 @@
             Alert: () => <i data-lucide="alert-circle" className="w-5 h-5 text-amber-500"></i>,
             Database: () => <i data-lucide="database" className="w-5 h-5"></i>,
             Link: () => <i data-lucide="link" className="w-4 h-4"></i>,
-            Refresh: () => <i data-lucide="refresh-cw" className="w-4 h-4"></i>
+            Refresh: () => <i data-lucide="refresh-cw" className="w-4 h-4"></i>,
+            Calendar: () => <i data-lucide="calendar" className="w-4 h-4"></i>
         };
 
         // --- Main Application ---
@@ -225,12 +226,47 @@
                     reader.onload = (e) => {
                         try {
                             const data = new Uint8Array(e.target.result);
-                            const workbook = XLSX.read(data, { type: 'array' });
+                            
+                            // 1. cellDates: true tells SheetJS to parse numbers as Date objects if formatted as dates
+                            const workbook = XLSX.read(data, { type: 'array', cellDates: true });
                             const firstSheetName = workbook.SheetNames[0];
                             const worksheet = workbook.Sheets[firstSheetName];
-                            // Parse data, treat all as strings initially to avoid type mismatches during loose comparison
+                            
+                            // 2. Convert to JSON with raw: false/defval options
                             const jsonData = XLSX.utils.sheet_to_json(worksheet, { defval: "" }); 
-                            resolve(jsonData);
+                            
+                            // 3. Post-process to fix dates intelligently
+                            const cleanData = jsonData.map(row => {
+                                const newRow = {};
+                                Object.keys(row).forEach(key => {
+                                    let val = row[key];
+                                    
+                                    // Check if it is a Date object (SheetJS converts Excel serial dates to JS Date objects)
+                                    if (val instanceof Date && !isNaN(val)) {
+                                        const y = val.getFullYear();
+                                        const m = String(val.getMonth() + 1).padStart(2, '0');
+                                        const d = String(val.getDate()).padStart(2, '0');
+                                        
+                                        const hours = val.getHours();
+                                        const minutes = val.getMinutes();
+
+                                        // If there is any time component (not midnight), assume time is relevant
+                                        if (hours !== 0 || minutes !== 0) {
+                                            const hh = String(hours).padStart(2, '0');
+                                            const mm = String(minutes).padStart(2, '0');
+                                            val = `${y}-${m}-${d} ${hh}:${mm}`;
+                                        } else {
+                                            // Pure date
+                                            val = `${y}-${m}-${d}`;
+                                        }
+                                    }
+                                    
+                                    newRow[key] = val;
+                                });
+                                return newRow;
+                            });
+
+                            resolve(cleanData);
                         } catch (err) {
                             reject(err);
                         }
@@ -303,9 +339,6 @@
                     
                     // 1. Identify valid Anchor IDs
                     let validAnchors = new Set();
-                    
-                    // Logic for "Primary" file for iteration? Or Union of all?
-                    // Typically "Full Outer Join" based on anchors is best, or "Filter-based".
                     
                     if (enableFilter && filterConfig.column && filterConfig.value && filterConfig.sourceFile) {
                         // Filter Mode: Only anchors present in the filtered source
@@ -448,6 +481,10 @@
                                     </div>
                                     <p className="font-medium text-slate-700">Click or Drag files here to upload</p>
                                     <p className="text-sm text-slate-500 mt-1">Supports CSV, Excel (.xlsx, .xls)</p>
+                                    <div className="mt-4 flex items-center justify-center gap-2 text-xs text-blue-600 bg-blue-100 px-3 py-1 rounded-full">
+                                        <Icons.Calendar />
+                                        <span>Auto-fixes date formats</span>
+                                    </div>
                                 </div>
 
                                 {files.length > 0 && (
